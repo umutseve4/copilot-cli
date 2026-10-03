@@ -19,7 +19,7 @@ BASE = os.environ.get("COPILOT_DL_URL", "https://directline.botframework.com").r
 USER_ID = "dl_umut_cli"
 POLL_INTERVAL = 0.7      # saniye
 FIRST_REPLY_TIMEOUT = 120  # agent'ın ilk cevabı için bekleme
-QUIET_AFTER_REPLY = 2.5    # son mesajdan sonra başka mesaj gelmezse bitir
+QUIET_AFTER_REPLY = 6      # son aktiviteden (mesaj/typing) sonra bu kadar sessizlik olursa bitir
 
 for s in (sys.stdout, sys.stderr):
     try:
@@ -75,21 +75,56 @@ class DirectLine:
         self.watermark = res.get("watermark", self.watermark)
         return res.get("activities", [])
 
-    def ask(self, text):
+    def ask(self, text, on_reply=None):
+        """Mesaj gönderir; agent'ın cevaplarını gelir gelmez on_reply ile verir.
+        'typing' göstergesi geldikçe beklemeye devam eder (uzun düşünen modeller için)."""
         self.send(text)
-        replies, start, last = [], time.time(), None
+        replies, start, last_msg, last_any = [], time.time(), None, None
         while True:
             for a in self.poll():
-                if a.get("from", {}).get("id") == USER_ID or a.get("type") != "message":
+                if a.get("from", {}).get("id") == USER_ID:
                     continue
-                replies.append(render(a))
-                last = time.time()
+                last_any = time.time()
+                if a.get("type") != "message":
+                    continue
+                r = render(a)
+                if not r:
+                    continue
+                replies.append(r)
+                last_msg = time.time()
+                if on_reply:
+                    on_reply(r)
             now = time.time()
-            if last and now - last > QUIET_AFTER_REPLY:
+            if last_msg and now - (last_any or last_msg) > QUIET_AFTER_REPLY:
                 return replies
-            if not last and now - start > FIRST_REPLY_TIMEOUT:
-                return replies or ["[agent cevap vermedi - zaman aşımı]"]
+            if not last_msg and now - start > FIRST_REPLY_TIMEOUT:
+                msg = "[agent cevap vermedi - zaman aşımı]"
+                replies.append(msg)
+                if on_reply:
+                    on_reply(msg)
+                return replies
             time.sleep(POLL_INTERVAL)
+
+
+def card_text(el):
+    """Adaptive Card içindeki metinleri düz yazıya çevirir."""
+    out = []
+    if isinstance(el, dict):
+        t = el.get("type") or ""
+        if t in ("TextBlock", "TextRun") and el.get("text"):
+            out.append(el["text"])
+        elif t == "FactSet":
+            out += [f"{f.get('title')}: {f.get('value')}" for f in el.get("facts", [])]
+        elif t.startswith("Action.") and el.get("title"):
+            link = el.get("url")
+            out.append(f"  > {el['title']}" + (f" ({link})" if link else ""))
+        for k in ("body", "items", "columns", "inlines", "actions", "card"):
+            if k in el:
+                out += card_text(el[k])
+    elif isinstance(el, list):
+        for x in el:
+            out += card_text(x)
+    return out
 
 
 def render(a):
@@ -97,7 +132,10 @@ def render(a):
     for att in a.get("attachments") or []:
         c = att.get("content")
         if isinstance(c, dict):
-            parts.append(c.get("text") or json.dumps(c, ensure_ascii=False)[:500])
+            if c.get("type") == "AdaptiveCard" or "body" in c:
+                parts += card_text(c)
+            else:
+                parts.append(c.get("text") or c.get("title") or json.dumps(c, ensure_ascii=False)[:500])
         elif att.get("contentUrl"):
             parts.append(f"[ek] {att['contentUrl']}")
     for sa in (a.get("suggestedActions") or {}).get("actions", []):
@@ -116,7 +154,7 @@ def main():
     args = sys.argv[1:]
     if args:
         text = sys.stdin.read() if args == ["-"] else " ".join(args)
-        print("\n\n".join(dl.ask(text)))
+        dl.ask(text, on_reply=lambda r: print(r + "\n", flush=True))
         return
 
     print("Copilot Studio CLI - çıkmak için 'exit' / Ctrl+C\n")
@@ -130,8 +168,8 @@ def main():
             continue
         if text.lower() in ("exit", "quit", "çık"):
             break
-        for r in dl.ask(text):
-            print(f"\nagent > {r}\n")
+        print()
+        dl.ask(text, on_reply=lambda r: print(f"agent > {r}\n", flush=True))
 
 
 if __name__ == "__main__":
